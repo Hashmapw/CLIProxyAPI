@@ -73,6 +73,8 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
+	e.ensureCodexToolsListOnRawRequest(httpReq)
+	e.ensureCodexSessionTripleOnRawRequest(httpReq)
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
@@ -116,12 +118,18 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if !gjson.GetBytes(body, "instructions").Exists() {
 		body, _ = sjson.SetBytes(body, "instructions", "")
 	}
+	body = normalizeCodexToolsList(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
+	sessionID, cacheKey := e.resolveCodexSessionID(ctx, from, req)
+	body, _ = sjson.SetBytes(body, "prompt_cache_key", sessionID)
+	body = setPromptCacheKeyInContexts(body, sessionID)
+	log.Debugf("codex executor: session triple set to: %s (cacheKey=%s, from=%s)", sessionID, cacheKey, from)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return resp, err
 	}
+	httpReq.Header.Set("Session_id", sessionID)
 	applyCodexHeaders(httpReq, auth, apiKey, true)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -156,6 +164,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
 		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		deleteCodexCache(cacheKey)
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return resp, err
 	}
@@ -173,7 +182,18 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 
 		line = bytes.TrimSpace(line[5:])
-		if gjson.GetBytes(line, "type").String() != "response.completed" {
+		lineType := gjson.GetBytes(line, "type").String()
+
+		if lineType == "error" {
+			errorCode := gjson.GetBytes(line, "code").String()
+			errorMsg := gjson.GetBytes(line, "message").String()
+			logWithRequestID(ctx).Debugf("codex executor: received error in response data - code: %s, message: %s", errorCode, errorMsg)
+			deleteCodexCache(cacheKey)
+			err = statusErr{code: 400, msg: fmt.Sprintf("error type: %s, code: %s, message: %s", lineType, errorCode, errorMsg)}
+			return resp, err
+		}
+
+		if lineType != "response.completed" {
 			continue
 		}
 
@@ -186,6 +206,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		resp = cliproxyexecutor.Response{Payload: []byte(out)}
 		return resp, nil
 	}
+	deleteCodexCache(cacheKey)
 	err = statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
 	return resp, err
 }
@@ -220,12 +241,17 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
+	body = normalizeCodexToolsList(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
+	sessionID, cacheKey := e.resolveCodexSessionID(ctx, from, req)
+	body, _ = sjson.SetBytes(body, "prompt_cache_key", sessionID)
+	body = setPromptCacheKeyInContexts(body, sessionID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return resp, err
 	}
+	httpReq.Header.Set("Session_id", sessionID)
 	applyCodexHeaders(httpReq, auth, apiKey, false)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -260,6 +286,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
 		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		deleteCodexCache(cacheKey)
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return resp, err
 	}
@@ -315,12 +342,17 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if !gjson.GetBytes(body, "instructions").Exists() {
 		body, _ = sjson.SetBytes(body, "instructions", "")
 	}
+	body = normalizeCodexToolsList(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
+	sessionID, cacheKey := e.resolveCodexSessionID(ctx, from, req)
+	body, _ = sjson.SetBytes(body, "prompt_cache_key", sessionID)
+	body = setPromptCacheKeyInContexts(body, sessionID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
+	httpReq.Header.Set("Session_id", sessionID)
 	applyCodexHeaders(httpReq, auth, apiKey, true)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -358,6 +390,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 		appendAPIResponseChunk(ctx, e.cfg, data)
 		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		deleteCodexCache(cacheKey)
 		err = statusErr{code: httpResp.StatusCode, msg: string(data)}
 		return nil, err
 	}
@@ -379,7 +412,19 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
-				if gjson.GetBytes(data, "type").String() == "response.completed" {
+				dataType := gjson.GetBytes(data, "type").String()
+
+				if dataType == "error" {
+					errorCode := gjson.GetBytes(data, "code").String()
+					errorMsg := gjson.GetBytes(data, "message").String()
+					logWithRequestID(ctx).Debugf("codex executor: received error in stream data - code: %s, message: %s", errorCode, errorMsg)
+					deleteCodexCache(cacheKey)
+					reporter.publishFailure(ctx)
+					out <- cliproxyexecutor.StreamChunk{Err: fmt.Errorf("error type: %s, code: %s, message: %s", dataType, errorCode, errorMsg)}
+					return
+				}
+
+				if dataType == "response.completed" {
 					if detail, ok := parseCodexUsage(data); ok {
 						reporter.publish(ctx, detail)
 					}
@@ -393,6 +438,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			recordAPIResponseError(ctx, e.cfg, errScan)
+			deleteCodexCache(cacheKey)
 			reporter.publishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
 		}
@@ -597,41 +643,214 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	return auth, nil
 }
 
-func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte) (*http.Request, error) {
-	var cache codexCache
+// resolveCodexSessionID determines the session ID to use for the three-way
+// consistency (prompt_cache_key, Session_id, Conversation_id).
+// It returns the session ID and the cache key (for invalidation on error).
+func (e *CodexExecutor) resolveCodexSessionID(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request) (sessionID, cacheKey string) {
+	// Collect the three IDs from the incoming request for consistency check.
+	incomingPromptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key").String()
+	var incomingSessionID, incomingConversationID string
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		incomingSessionID = strings.TrimSpace(ginCtx.Request.Header.Get("Session_id"))
+		incomingConversationID = strings.TrimSpace(ginCtx.Request.Header.Get("Conversation_id"))
+	}
+
+	// Check if all three incoming values are present and consistent.
+	incomingConsistent := incomingPromptCacheKey != "" &&
+		incomingSessionID != "" &&
+		incomingConversationID != "" &&
+		incomingPromptCacheKey == incomingSessionID &&
+		incomingSessionID == incomingConversationID
+	incomingHeaderConsistent := incomingSessionID != "" &&
+		incomingConversationID != "" &&
+		incomingSessionID == incomingConversationID
+
 	if from == "claude" {
 		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
 		if userIDResult.Exists() {
-			key := fmt.Sprintf("%s-%s", req.Model, userIDResult.String())
-			var ok bool
-			if cache, ok = getCodexCache(key); !ok {
-				cache = codexCache{
-					ID:     uuid.New().String(),
-					Expire: time.Now().Add(1 * time.Hour),
-				}
-				setCodexCache(key, cache)
+			cacheKey = fmt.Sprintf("%s-%s", req.Model, userIDResult.String())
+			if cache, ok := getCodexCache(cacheKey); ok {
+				sessionID = cache.ID
+				return
 			}
+			// No valid cache; if incoming values are present, adopt them.
+			if incomingConsistent {
+				sessionID = incomingPromptCacheKey
+			} else if incomingHeaderConsistent {
+				sessionID = incomingSessionID
+			} else if incomingPromptCacheKey != "" {
+				sessionID = incomingPromptCacheKey
+			} else if incomingSessionID != "" {
+				sessionID = incomingSessionID
+			} else if incomingConversationID != "" {
+				sessionID = incomingConversationID
+			} else {
+				sessionID = uuid.New().String()
+			}
+			setCodexCache(cacheKey, codexCache{
+				ID:     sessionID,
+				Expire: time.Now().Add(3 * time.Hour),
+			})
+			return
 		}
 	} else if from == "openai-response" {
-		promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key")
-		if promptCacheKey.Exists() {
-			cache.ID = promptCacheKey.String()
+		if incomingConsistent {
+			sessionID = incomingPromptCacheKey
+			return
+		} else if incomingHeaderConsistent {
+			sessionID = incomingSessionID
+			return
+		} else if incomingPromptCacheKey != "" {
+			sessionID = incomingPromptCacheKey
+			return
+		} else if incomingSessionID != "" {
+			sessionID = incomingSessionID
+			return
+		} else if incomingConversationID != "" {
+			sessionID = incomingConversationID
+			return
 		}
 	}
 
-	if cache.ID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
+	// Fallback: generate a new ID so all three fields are always set.
+	if sessionID == "" {
+		sessionID = uuid.New().String()
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
-	if err != nil {
-		return nil, err
-	}
-	if cache.ID != "" {
-		httpReq.Header.Set("Conversation_id", cache.ID)
-		httpReq.Header.Set("Session_id", cache.ID)
-	}
-	return httpReq, nil
+	return
 }
+
+func (e *CodexExecutor) ensureCodexSessionTripleOnRawRequest(req *http.Request) {
+	if req == nil || req.URL == nil || req.Body == nil {
+		return
+	}
+	if req.Method != "" && !strings.EqualFold(req.Method, http.MethodPost) {
+		return
+	}
+	path := strings.TrimSpace(req.URL.Path)
+	if path != "" &&
+		!strings.HasSuffix(path, "/responses") &&
+		!strings.HasSuffix(path, "/responses/compact") {
+		return
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		req.ContentLength = int64(len(body))
+		return
+	}
+
+	promptCacheKey := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String())
+	incomingSessionID := strings.TrimSpace(req.Header.Get("Session_id"))
+	incomingConversationID := strings.TrimSpace(req.Header.Get("Conversation_id"))
+
+	sessionID := promptCacheKey
+	if sessionID == "" {
+		sessionID = incomingSessionID
+	}
+	if sessionID == "" {
+		sessionID = incomingConversationID
+	}
+
+	if sessionID == "" {
+		userIDResult := gjson.GetBytes(body, "metadata.user_id")
+		model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+		if userIDResult.Exists() && model != "" {
+			cacheKey := fmt.Sprintf("%s-%s", model, userIDResult.String())
+			if cache, ok := getCodexCache(cacheKey); ok {
+				sessionID = cache.ID
+			} else {
+				sessionID = uuid.New().String()
+				setCodexCache(cacheKey, codexCache{ID: sessionID, Expire: time.Now().Add(3 * time.Hour)})
+			}
+		}
+	}
+	if sessionID == "" {
+		sessionID = uuid.New().String()
+	}
+
+	if updated, errSet := sjson.SetBytes(body, "prompt_cache_key", sessionID); errSet == nil {
+		body = updated
+	}
+	body = setPromptCacheKeyInContexts(body, sessionID)
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	req.Header.Set("Session_id", sessionID)
+}
+
+func setPromptCacheKeyInContexts(rawJSON []byte, promptCacheKey string) []byte {
+	if strings.TrimSpace(promptCacheKey) == "" {
+		return rawJSON
+	}
+	contexts := gjson.GetBytes(rawJSON, "contexts")
+	if !contexts.Exists() {
+		return rawJSON
+	}
+	if contexts.IsArray() {
+		result := rawJSON
+		arr := contexts.Array()
+		for i := range arr {
+			path := fmt.Sprintf("contexts.%d.prompt_cache_key", i)
+			if updated, err := sjson.SetBytes(result, path, promptCacheKey); err == nil {
+				result = updated
+			}
+		}
+		return result
+	}
+	if contexts.IsObject() {
+		if updated, err := sjson.SetBytes(rawJSON, "contexts.prompt_cache_key", promptCacheKey); err == nil {
+			return updated
+		}
+	}
+	return rawJSON
+}
+
+func (e *CodexExecutor) ensureCodexToolsListOnRawRequest(req *http.Request) {
+	if req == nil || req.URL == nil || req.Body == nil {
+		return
+	}
+	if req.Method != "" && !strings.EqualFold(req.Method, http.MethodPost) {
+		return
+	}
+	path := strings.TrimSpace(req.URL.Path)
+	if path != "" &&
+		!strings.HasSuffix(path, "/responses") &&
+		!strings.HasSuffix(path, "/responses/compact") {
+		return
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return
+	}
+	body = normalizeCodexToolsList(body)
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+}
+
+func normalizeCodexToolsList(rawJSON []byte) []byte {
+	result := rawJSON
+	result, _ = sjson.SetBytes(result, "parallel_tool_calls", false)
+
+	tools := gjson.GetBytes(result, "tools")
+	if tools.Exists() && tools.IsArray() && len(tools.Array()) == 0 {
+		return result
+	}
+
+	result = setDefaultCodexTools(result)
+	return result
+}
+
+func setDefaultCodexTools(rawJSON []byte) []byte {
+	if updated, err := sjson.SetRawBytes(rawJSON, "tools", []byte(defaultCodexToolsJSON)); err == nil {
+		return updated
+	}
+	return rawJSON
+}
+
+const defaultCodexToolsJSON = `[{"type":"web_search","external_web_access":true}]`
 
 func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool) {
 	r.Header.Set("Content-Type", "application/json")
@@ -644,7 +863,6 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", codexClientVersion)
 	misc.EnsureHeader(r.Header, ginHeaders, "Openai-Beta", "responses=experimental")
-	misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
 	misc.EnsureHeader(r.Header, ginHeaders, "User-Agent", codexUserAgent)
 
 	if stream {

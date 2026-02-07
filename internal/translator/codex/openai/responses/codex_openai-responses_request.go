@@ -20,6 +20,7 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 	rawJSON, _ = sjson.SetBytes(rawJSON, "store", false)
 	rawJSON, _ = sjson.SetBytes(rawJSON, "parallel_tool_calls", true)
 	rawJSON, _ = sjson.SetBytes(rawJSON, "include", []string{"reasoning.encrypted_content"})
+	rawJSON = normalizeToolsToArray(rawJSON)
 	// Codex Responses rejects token limit fields, so strip them out before forwarding.
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "max_output_tokens")
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "max_completion_tokens")
@@ -30,6 +31,18 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 	// Convert role "system" to "developer" in input array to comply with Codex API requirements.
 	rawJSON = convertSystemRoleToDeveloper(rawJSON)
 
+	return rawJSON
+}
+
+func normalizeToolsToArray(rawJSON []byte) []byte {
+	tools := gjson.GetBytes(rawJSON, "tools")
+	if !tools.Exists() || tools.IsArray() {
+		return rawJSON
+	}
+	wrapped := fmt.Sprintf("[%s]", tools.Raw)
+	if updated, err := sjson.SetRawBytes(rawJSON, "tools", []byte(wrapped)); err == nil {
+		return updated
+	}
 	return rawJSON
 }
 

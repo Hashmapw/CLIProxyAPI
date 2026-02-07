@@ -2,6 +2,8 @@ module github.com/router-for-me/CLIProxyAPI/v6
 
 go 1.24.0
 
+toolchain go1.24.3
+
 require (
 	github.com/andybalholm/brotli v1.0.6
 	github.com/fsnotify/fsnotify v1.9.0

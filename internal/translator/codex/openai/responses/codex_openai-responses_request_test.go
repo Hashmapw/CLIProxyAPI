@@ -263,3 +263,25 @@ func TestConvertSystemRoleToDeveloper_AssistantRole(t *testing.T) {
 		t.Errorf("Expected third role 'assistant', got '%s'", thirdRole.String())
 	}
 }
+
+func TestConvertOpenAIResponsesRequestToCodex_NormalizeToolsToArray(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.3-codex",
+		"input": "hi",
+		"tools": {
+			"type": "function",
+			"name": "echo",
+			"description": "x",
+			"parameters": {"type": "object"}
+		}
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.3-codex", inputJSON, false)
+	tools := gjson.GetBytes(output, "tools")
+	if !tools.IsArray() {
+		t.Fatalf("tools should be array, got: %s", tools.Raw)
+	}
+	if len(tools.Array()) != 1 {
+		t.Fatalf("tools array length = %d, want 1", len(tools.Array()))
+	}
+}
