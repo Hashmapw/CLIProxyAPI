@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -213,9 +214,13 @@ func TestCodexHttpRequestNormalizesToolsToArray(t *testing.T) {
 	if !tools.IsArray() {
 		t.Fatalf("tools should be array, got: %s", tools.Raw)
 	}
-	assertDefaultWebSearchOnly(t, rt.body)
-	if got := gjson.GetBytes(rt.body, "parallel_tool_calls").Bool(); got {
-		t.Fatalf("parallel_tool_calls should be false")
+	if got := len(tools.Array()); got != 2 {
+		t.Fatalf("tools length = %d, want 2", got)
+	}
+	assertHasFunctionToolByName(t, rt.body, "echo")
+	assertHasWebSearchTool(t, rt.body)
+	if got := gjson.GetBytes(rt.body, "parallel_tool_calls").Bool(); !got {
+		t.Fatalf("parallel_tool_calls should be true")
 	}
 }
 
@@ -249,24 +254,29 @@ func TestCodexHttpRequestNormalizesStringToolsToFunctionObjects(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 
-	if got := gjson.GetBytes(rt.body, "parallel_tool_calls").Bool(); got {
-		t.Fatalf("parallel_tool_calls should be false")
+	if got := gjson.GetBytes(rt.body, "parallel_tool_calls").Bool(); !got {
+		t.Fatalf("parallel_tool_calls should be true")
 	}
 	tools := gjson.GetBytes(rt.body, "tools")
 	if !tools.IsArray() {
 		t.Fatalf("tools should be array, got: %s", tools.Raw)
 	}
-	assertDefaultWebSearchOnly(t, rt.body)
+	if got := len(tools.Array()); got != 2 {
+		t.Fatalf("tools length = %d, want 2", got)
+	}
+	assertHasFunctionToolByName(t, rt.body, "6666")
+	assertHasWebSearchTool(t, rt.body)
 }
 
 func TestNormalizeCodexToolsListForExecutePath(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.3-codex","tools":["6666"],"parallel_tool_calls":true}`)
 	out := normalizeCodexToolsList(body)
 
-	if got := gjson.GetBytes(out, "parallel_tool_calls").Bool(); got {
-		t.Fatalf("parallel_tool_calls should be false")
+	if got := gjson.GetBytes(out, "parallel_tool_calls").Bool(); !got {
+		t.Fatalf("parallel_tool_calls should be true")
 	}
-	assertDefaultWebSearchOnly(t, out)
+	assertHasFunctionToolByName(t, out, "6666")
+	assertHasWebSearchTool(t, out)
 }
 
 func TestNormalizeCodexToolsListBlocksOSLevelBuiltins(t *testing.T) {
@@ -284,14 +294,20 @@ func TestNormalizeCodexToolsListBlocksOSLevelBuiltins(t *testing.T) {
 	}`)
 	out := normalizeCodexToolsList(body)
 
-	if got := gjson.GetBytes(out, "parallel_tool_calls").Bool(); got {
-		t.Fatalf("parallel_tool_calls should be false")
+	if got := gjson.GetBytes(out, "parallel_tool_calls").Bool(); !got {
+		t.Fatalf("parallel_tool_calls should be true")
 	}
 	tools := gjson.GetBytes(out, "tools")
 	if !tools.IsArray() {
 		t.Fatalf("tools should be array, got: %s", tools.Raw)
 	}
-	assertDefaultWebSearchOnly(t, out)
+	if got := len(tools.Array()); got == 0 {
+		t.Fatalf("tools should not be empty")
+	}
+	assertHasFunctionToolByName(t, out, "code_interpreter")
+	assertHasFunctionToolByName(t, out, "computer_use_preview")
+	assertHasFunctionToolByName(t, out, "6666")
+	assertHasWebSearchTool(t, out)
 }
 
 func TestNormalizeCodexToolsListKeepsEmptyToolsArray(t *testing.T) {
@@ -305,8 +321,8 @@ func TestNormalizeCodexToolsListKeepsEmptyToolsArray(t *testing.T) {
 	if len(tools.Array()) != 0 {
 		t.Fatalf("tools length = %d, want 0", len(tools.Array()))
 	}
-	if got := gjson.GetBytes(out, "parallel_tool_calls").Bool(); got {
-		t.Fatalf("parallel_tool_calls should be false")
+	if got := gjson.GetBytes(out, "parallel_tool_calls").Bool(); !got {
+		t.Fatalf("parallel_tool_calls should be true")
 	}
 }
 
@@ -314,7 +330,124 @@ func TestNormalizeCodexToolsListSetsDefaultWhenToolsMissing(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.3-codex","input":"hello"}`)
 	out := normalizeCodexToolsList(body)
 
-	assertDefaultWebSearchOnly(t, out)
+	assertHasOnlyWebSearchTool(t, out)
+}
+
+func TestNormalizeCodexToolsListConvertsInputSchemaToFunctionParameters(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"tools":[
+			{
+				"name":"Task",
+				"description":"Launch task",
+				"input_schema":{
+					"$schema":"https://json-schema.org/draft/2020-12/schema",
+					"type":"object",
+					"properties":{"prompt":{"type":"string"}},
+					"required":["prompt"]
+				}
+			}
+		]
+	}`)
+	out := normalizeCodexToolsList(body)
+
+	assertHasFunctionToolByName(t, out, "Task")
+	if got := gjson.GetBytes(out, "tools.0.type").String(); got != "function" {
+		t.Fatalf("tools.0.type = %q, want %q", got, "function")
+	}
+	if got := gjson.GetBytes(out, "tools.0.parameters.type").String(); got != "object" {
+		t.Fatalf("tools.0.parameters.type = %q, want %q", got, "object")
+	}
+	if got := gjson.GetBytes(out, "tools.0.parameters.properties.prompt.type").String(); got != "string" {
+		t.Fatalf("tools.0.parameters.properties.prompt.type = %q, want %q", got, "string")
+	}
+	if gjson.GetBytes(out, "tools.0.input_schema").Exists() {
+		t.Fatalf("tools.0.input_schema should be removed")
+	}
+	if gjson.GetBytes(out, "tools.0.parameters.$schema").Exists() {
+		t.Fatalf("tools.0.parameters.$schema should be removed")
+	}
+	assertHasWebSearchTool(t, out)
+}
+
+func TestNormalizeCodexToolsListPreservesStrictField(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"tools":[
+			{
+				"type":"function",
+				"name":"exec_command",
+				"description":"run command",
+				"strict":false,
+				"parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}
+			},
+			{
+				"type":"function",
+				"name":"write_stdin",
+				"description":"write stdin",
+				"strict":true,
+				"parameters":{"type":"object","properties":{"session_id":{"type":"number"}},"required":["session_id"]}
+			}
+		]
+	}`)
+	out := normalizeCodexToolsList(body)
+
+	if !gjson.GetBytes(out, `tools.#(name=="exec_command").strict`).Exists() {
+		t.Fatalf("exec_command.strict should exist")
+	}
+	if got := gjson.GetBytes(out, `tools.#(name=="exec_command").strict`).Bool(); got {
+		t.Fatalf("exec_command.strict = %v, want false", got)
+	}
+	if !gjson.GetBytes(out, `tools.#(name=="write_stdin").strict`).Exists() {
+		t.Fatalf("write_stdin.strict should exist")
+	}
+	if got := gjson.GetBytes(out, `tools.#(name=="write_stdin").strict`).Bool(); !got {
+		t.Fatalf("write_stdin.strict = %v, want true", got)
+	}
+	assertHasWebSearchTool(t, out)
+	assertToolChoiceAuto(t, out)
+}
+
+func TestNormalizeCodexToolsListForcesToolChoiceAuto(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"tool_choice":{"type":"function","name":"exec_command"},
+		"tools":[{"type":"function","name":"exec_command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]
+	}`)
+	out := normalizeCodexToolsList(body)
+	assertToolChoiceAuto(t, out)
+}
+
+func TestCodexHttpRequestForcesToolChoiceAuto(t *testing.T) {
+	rt := &captureRoundTripper{status: http.StatusOK, respBody: `{"ok":true}`}
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(rt))
+
+	exec := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "test-key"}}
+	reqURL, errURL := url.Parse("https://example.invalid/backend-api/codex/responses")
+	if errURL != nil {
+		t.Fatalf("parse url failed: %v", errURL)
+	}
+	bodyJSON := `{"model":"gpt-5","tool_choice":"none","tools":[{"type":"function","name":"exec_command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}],"input":"hi"}`
+	httpReq := &http.Request{
+		Method: http.MethodPost,
+		URL:    reqURL,
+		Header: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body:          io.NopCloser(strings.NewReader(bodyJSON)),
+		ContentLength: int64(len(bodyJSON)),
+	}
+
+	resp, errReq := exec.HttpRequest(ctx, auth, httpReq)
+	if errReq != nil {
+		t.Fatalf("HttpRequest error: %v", errReq)
+	}
+	if resp != nil && resp.Body != nil {
+		_, _ = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+	}
+	assertToolChoiceAuto(t, rt.body)
 }
 
 func TestCodexHttpRequestSetsPromptCacheKeyInContextsArray(t *testing.T) {
@@ -408,7 +541,7 @@ func assertSessionTripleInCapturedRequest(t *testing.T, rt *captureRoundTripper)
 	}
 }
 
-func assertDefaultWebSearchOnly(t *testing.T, raw []byte) {
+func assertHasOnlyWebSearchTool(t *testing.T, raw []byte) {
 	t.Helper()
 	tools := gjson.GetBytes(raw, "tools")
 	if !tools.IsArray() {
@@ -417,10 +550,49 @@ func assertDefaultWebSearchOnly(t *testing.T, raw []byte) {
 	if got := len(tools.Array()); got != 1 {
 		t.Fatalf("tools length = %d, want 1", got)
 	}
-	if got := gjson.GetBytes(raw, "tools.0.type").String(); got != "web_search" {
-		t.Fatalf("tools.0.type = %q, want %q", got, "web_search")
+	assertHasWebSearchTool(t, raw)
+}
+
+func assertHasWebSearchTool(t *testing.T, raw []byte) {
+	t.Helper()
+	tools := gjson.GetBytes(raw, "tools")
+	if !tools.IsArray() {
+		t.Fatalf("tools should be array, got: %s", tools.Raw)
 	}
-	if got := gjson.GetBytes(raw, "tools.0.external_web_access").Bool(); !got {
-		t.Fatalf("tools.0.external_web_access should be true")
+	arr := tools.Array()
+	for i := range arr {
+		if gjson.GetBytes(raw, "tools."+strconv.Itoa(i)+".type").String() != "web_search" {
+			continue
+		}
+		if got := gjson.GetBytes(raw, "tools."+strconv.Itoa(i)+".external_web_access").Bool(); !got {
+			t.Fatalf("tools.%d.external_web_access should be true", i)
+		}
+		return
+	}
+	t.Fatalf("web_search tool not found")
+}
+
+func assertHasFunctionToolByName(t *testing.T, raw []byte, name string) {
+	t.Helper()
+	tools := gjson.GetBytes(raw, "tools")
+	if !tools.IsArray() {
+		t.Fatalf("tools should be array, got: %s", tools.Raw)
+	}
+	arr := tools.Array()
+	for i := range arr {
+		if gjson.GetBytes(raw, "tools."+strconv.Itoa(i)+".type").String() != "function" {
+			continue
+		}
+		if gjson.GetBytes(raw, "tools."+strconv.Itoa(i)+".name").String() == name {
+			return
+		}
+	}
+	t.Fatalf("function tool %q not found", name)
+}
+
+func assertToolChoiceAuto(t *testing.T, raw []byte) {
+	t.Helper()
+	if got := gjson.GetBytes(raw, "tool_choice").String(); got != "auto" {
+		t.Fatalf("tool_choice = %q, want %q", got, "auto")
 	}
 }

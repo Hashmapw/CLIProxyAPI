@@ -832,15 +832,193 @@ func (e *CodexExecutor) ensureCodexToolsListOnRawRequest(req *http.Request) {
 
 func normalizeCodexToolsList(rawJSON []byte) []byte {
 	result := rawJSON
-	result, _ = sjson.SetBytes(result, "parallel_tool_calls", false)
+	result, _ = sjson.SetBytes(result, "parallel_tool_calls", true)
+	result, _ = sjson.SetBytes(result, "tool_choice", "auto")
 
 	tools := gjson.GetBytes(result, "tools")
-	if tools.Exists() && tools.IsArray() && len(tools.Array()) == 0 {
+	if !tools.Exists() {
+		return setDefaultCodexTools(result)
+	}
+	if tools.IsArray() && len(tools.Array()) == 0 {
 		return result
 	}
-
-	result = setDefaultCodexTools(result)
+	normalizedTools := normalizeCodexToolsArray(tools)
+	if len(normalizedTools) == 0 {
+		return setDefaultCodexTools(result)
+	}
+	if updated, err := sjson.SetRawBytes(result, "tools", normalizedTools); err == nil {
+		return updated
+	}
 	return result
+}
+
+func normalizeCodexToolsArray(tools gjson.Result) []byte {
+	toolResults := []gjson.Result{tools}
+	if tools.IsArray() {
+		toolResults = tools.Array()
+	}
+
+	normalized := make([]string, 0, len(toolResults)+1)
+	hasWebSearch := false
+	for i := range toolResults {
+		item, isWebSearch := normalizeCodexTool(toolResults[i])
+		if strings.TrimSpace(item) == "" {
+			continue
+		}
+		normalized = append(normalized, item)
+		if isWebSearch {
+			hasWebSearch = true
+		}
+	}
+
+	if !hasWebSearch {
+		normalized = append(normalized, defaultCodexWebSearchToolJSON)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return []byte("[" + strings.Join(normalized, ",") + "]")
+}
+
+func normalizeCodexTool(tool gjson.Result) (string, bool) {
+	if !tool.Exists() {
+		return "", false
+	}
+
+	if tool.Type == gjson.String {
+		name := strings.TrimSpace(tool.String())
+		if name == "" {
+			return "", false
+		}
+		if isWebSearchToolName(name) {
+			return defaultCodexWebSearchToolJSON, true
+		}
+		return buildCodexFunctionTool(name, "", "", false, false), false
+	}
+
+	if !tool.IsObject() {
+		return "", false
+	}
+
+	toolType := strings.TrimSpace(tool.Get("type").String())
+	if isWebSearchToolName(toolType) {
+		return defaultCodexWebSearchToolJSON, true
+	}
+
+	if functionTool := normalizeCodexFunctionTool(tool); functionTool != "" {
+		return functionTool, false
+	}
+
+	// Unsupported built-ins are converted into generic function tools so Codex can accept them.
+	if toolType != "" {
+		return buildCodexFunctionTool(toolType, tool.Get("description").String(), "", false, false), false
+	}
+	return "", false
+}
+
+func normalizeCodexFunctionTool(tool gjson.Result) string {
+	toolType := strings.TrimSpace(tool.Get("type").String())
+	name := strings.TrimSpace(tool.Get("name").String())
+	desc := tool.Get("description").String()
+	parameters := tool.Get("parameters")
+	inputSchema := tool.Get("input_schema")
+	strictValue, strictExists := extractCodexToolStrict(tool)
+
+	if function := tool.Get("function"); function.IsObject() {
+		if name == "" {
+			name = strings.TrimSpace(function.Get("name").String())
+		}
+		if strings.TrimSpace(desc) == "" {
+			desc = function.Get("description").String()
+		}
+		if !parameters.Exists() {
+			parameters = function.Get("parameters")
+		}
+		if !inputSchema.Exists() {
+			inputSchema = function.Get("input_schema")
+		}
+	}
+
+	if name == "" {
+		if toolType == "function" {
+			return ""
+		}
+		// Tools in {"name","input_schema"} style are always converted to function.
+		if !inputSchema.Exists() && !parameters.Exists() {
+			return ""
+		}
+	}
+
+	return buildCodexFunctionTool(name, desc, pickCodexToolSchema(parameters, inputSchema), strictValue, strictExists)
+}
+
+func buildCodexFunctionTool(name, description, schemaRaw string, strict bool, strictExists bool) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+
+	tool := `{"type":"function","name":"","parameters":{"type":"object","properties":{}}}`
+	tool, _ = sjson.Set(tool, "name", name)
+	if strings.TrimSpace(description) != "" {
+		tool, _ = sjson.Set(tool, "description", description)
+	}
+	tool, _ = sjson.SetRaw(tool, "parameters", normalizeCodexToolSchema(schemaRaw))
+	if strictExists {
+		tool, _ = sjson.Set(tool, "strict", strict)
+	}
+	return tool
+}
+
+func extractCodexToolStrict(tool gjson.Result) (bool, bool) {
+	if strict := tool.Get("strict"); strict.Exists() {
+		return strict.Bool(), true
+	}
+	if function := tool.Get("function"); function.IsObject() {
+		if strict := function.Get("strict"); strict.Exists() {
+			return strict.Bool(), true
+		}
+	}
+	return false, false
+}
+
+func pickCodexToolSchema(parameters, inputSchema gjson.Result) string {
+	if parameters.Exists() && strings.TrimSpace(parameters.Raw) != "" && strings.TrimSpace(parameters.Raw) != "null" {
+		return parameters.Raw
+	}
+	if inputSchema.Exists() && strings.TrimSpace(inputSchema.Raw) != "" && strings.TrimSpace(inputSchema.Raw) != "null" {
+		return inputSchema.Raw
+	}
+	return ""
+}
+
+func normalizeCodexToolSchema(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" || !gjson.Valid(raw) {
+		return `{"type":"object","properties":{}}`
+	}
+	schema := raw
+	parsed := gjson.Parse(raw)
+
+	schemaType := strings.TrimSpace(parsed.Get("type").String())
+	if schemaType == "" {
+		schema, _ = sjson.Set(schema, "type", "object")
+		schemaType = "object"
+	}
+	if schemaType == "object" && !parsed.Get("properties").Exists() {
+		schema, _ = sjson.SetRaw(schema, "properties", `{}`)
+	}
+	schema, _ = sjson.Delete(schema, "$schema")
+	return schema
+}
+
+func isWebSearchToolName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "web_search", "web_search_preview":
+		return true
+	default:
+		return false
+	}
 }
 
 func setDefaultCodexTools(rawJSON []byte) []byte {
@@ -850,7 +1028,10 @@ func setDefaultCodexTools(rawJSON []byte) []byte {
 	return rawJSON
 }
 
-const defaultCodexToolsJSON = `[{"type":"web_search","external_web_access":true}]`
+const (
+	defaultCodexWebSearchToolJSON = `{"type":"web_search","external_web_access":true}`
+	defaultCodexToolsJSON         = "[" + defaultCodexWebSearchToolJSON + "]"
+)
 
 func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool) {
 	r.Header.Set("Content-Type", "application/json")
