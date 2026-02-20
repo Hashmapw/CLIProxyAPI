@@ -349,6 +349,11 @@ func (s *Server) setupRoutes() {
 			},
 		})
 	})
+	// Some health-checkers probe with HEAD /. Gin does not auto-map GET -> HEAD,
+	// so register it explicitly to avoid noisy 404 logs.
+	s.engine.HEAD("/", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
 	s.engine.POST("/v1internal:method", geminiCLIHandlers.CLIHandler)
 
 	// OAuth callback endpoints (reuse main server port)

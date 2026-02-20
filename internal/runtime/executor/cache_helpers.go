@@ -11,7 +11,7 @@ type codexCache struct {
 }
 
 // codexCacheMap stores prompt cache IDs keyed by model+user_id.
-// Protected by codexCacheMu. Entries expire after 1 hour.
+// Protected by codexCacheMu. Entries expire after 3 hours.
 var (
 	codexCacheMap = make(map[string]codexCache)
 	codexCacheMu  sync.RWMutex
@@ -64,5 +64,15 @@ func setCodexCache(key string, cache codexCache) {
 	codexCacheCleanupOnce.Do(startCodexCacheCleanup)
 	codexCacheMu.Lock()
 	codexCacheMap[key] = cache
+	codexCacheMu.Unlock()
+}
+
+// deleteCodexCache removes a cache entry, forcing regeneration on the next request.
+func deleteCodexCache(key string) {
+	if key == "" {
+		return
+	}
+	codexCacheMu.Lock()
+	delete(codexCacheMap, key)
 	codexCacheMu.Unlock()
 }
