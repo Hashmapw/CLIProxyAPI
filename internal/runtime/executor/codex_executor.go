@@ -685,7 +685,7 @@ func (e *CodexExecutor) resolveCodexSessionID(ctx context.Context, from sdktrans
 			} else if incomingConversationID != "" {
 				sessionID = incomingConversationID
 			} else {
-				sessionID = uuid.New().String()
+				sessionID = generateCodexSessionID(ctx, "no incoming or cached session id in claude flow")
 			}
 			setCodexCache(cacheKey, codexCache{
 				ID:     sessionID,
@@ -714,7 +714,7 @@ func (e *CodexExecutor) resolveCodexSessionID(ctx context.Context, from sdktrans
 
 	// Fallback: generate a new ID so all three fields are always set.
 	if sessionID == "" {
-		sessionID = uuid.New().String()
+		sessionID = generateCodexSessionID(ctx, "fallback after session id resolution")
 	}
 	return
 }
@@ -763,13 +763,13 @@ func (e *CodexExecutor) ensureCodexSessionTripleOnRawRequest(req *http.Request) 
 			if cache, ok := getCodexCache(cacheKey); ok {
 				sessionID = cache.ID
 			} else {
-				sessionID = uuid.New().String()
+				sessionID = generateCodexSessionID(req.Context(), "no incoming or cached session id on raw request")
 				setCodexCache(cacheKey, codexCache{ID: sessionID, Expire: time.Now().Add(3 * time.Hour)})
 			}
 		}
 	}
 	if sessionID == "" {
-		sessionID = uuid.New().String()
+		sessionID = generateCodexSessionID(req.Context(), "final raw request fallback")
 	}
 
 	if updated, errSet := sjson.SetBytes(body, "prompt_cache_key", sessionID); errSet == nil {
@@ -806,6 +806,18 @@ func setPromptCacheKeyInContexts(rawJSON []byte, promptCacheKey string) []byte {
 		}
 	}
 	return rawJSON
+}
+
+func generateCodexSessionID(ctx context.Context, reason string) string {
+	sessionUUID, err := uuid.NewV7()
+	if err != nil {
+		sessionID := uuid.New().String()
+		logWithRequestID(ctx).Warnf("codex executor: generated fallback uuid v4 session id because uuid v7 failed (reason=%s, err=%v)", reason, err)
+		return sessionID
+	}
+	sessionID := sessionUUID.String()
+	logWithRequestID(ctx).Warnf("codex executor: generated new uuid v7 session id (reason=%s)", reason)
+	return sessionID
 }
 
 func (e *CodexExecutor) ensureCodexToolsListOnRawRequest(req *http.Request) {
