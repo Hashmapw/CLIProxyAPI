@@ -264,19 +264,41 @@ func TestConvertSystemRoleToDeveloper_AssistantRole(t *testing.T) {
 	}
 }
 
-func TestUserFieldDeletion(t *testing.T) {  
+func TestUserFieldDeletion(t *testing.T) {
 	inputJSON := []byte(`{  
 		"model": "gpt-5.2",  
 		"user": "test-user",  
 		"input": [{"role": "user", "content": "Hello"}]  
-	}`)  
-	  
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)  
-	outputStr := string(output)  
-	  
-	// Verify user field is deleted  
-	userField := gjson.Get(outputStr, "user")  
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	outputStr := string(output)
+
+	// Verify user field is deleted
+	userField := gjson.Get(outputStr, "user")
 	if userField.Exists() {
 		t.Errorf("user field should be deleted, but it was found with value: %s", userField.Raw)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToCodex_NormalizeToolsToArray(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.3-codex",
+		"input": "hi",
+		"tools": {
+			"type": "function",
+			"name": "echo",
+			"description": "x",
+			"parameters": {"type": "object"}
+		}
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.3-codex", inputJSON, false)
+	tools := gjson.GetBytes(output, "tools")
+	if !tools.IsArray() {
+		t.Fatalf("tools should be array, got: %s", tools.Raw)
+	}
+	if len(tools.Array()) != 1 {
+		t.Fatalf("tools array length = %d, want 1", len(tools.Array()))
 	}
 }
