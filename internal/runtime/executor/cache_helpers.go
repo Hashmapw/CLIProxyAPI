@@ -11,11 +11,13 @@ type codexCache struct {
 }
 
 // codexCacheMap stores prompt cache IDs keyed by model+user_id.
-// Protected by codexCacheMu. Entries expire after 1 hour.
+// Protected by codexCacheMu. Entries expire after codexSessionTTL.
 var (
 	codexCacheMap = make(map[string]codexCache)
 	codexCacheMu  sync.RWMutex
 )
+
+const codexSessionTTL = 3 * time.Hour
 
 // codexCacheCleanupInterval controls how often expired entries are purged.
 const codexCacheCleanupInterval = 15 * time.Minute
@@ -64,5 +66,15 @@ func setCodexCache(key string, cache codexCache) {
 	codexCacheCleanupOnce.Do(startCodexCacheCleanup)
 	codexCacheMu.Lock()
 	codexCacheMap[key] = cache
+	codexCacheMu.Unlock()
+}
+
+func deleteCodexCache(key string) {
+	if key == "" {
+		return
+	}
+	codexCacheCleanupOnce.Do(startCodexCacheCleanup)
+	codexCacheMu.Lock()
+	delete(codexCacheMap, key)
 	codexCacheMu.Unlock()
 }

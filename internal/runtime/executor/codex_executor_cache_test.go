@@ -7,13 +7,12 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
-func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFromAPIKey(t *testing.T) {
+func TestCodexExecutorCacheHelper_OpenAIChatCompletions_ReusesSessionUntilCacheDeletion(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
 	ginCtx.Set("apiKey", "test-api-key")
@@ -27,7 +26,7 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	}
 	url := "https://example.com/responses"
 
-	httpReq, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON)
+	httpReq, cacheKey, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON)
 	if err != nil {
 		t.Fatalf("cacheHelper error: %v", err)
 	}
@@ -37,28 +36,44 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 		t.Fatalf("read request body: %v", errRead)
 	}
 
-	expectedKey := uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:test-api-key")).String()
-	gotKey := gjson.GetBytes(body, "prompt_cache_key").String()
-	if gotKey != expectedKey {
-		t.Fatalf("prompt_cache_key = %q, want %q", gotKey, expectedKey)
+	firstKey := gjson.GetBytes(body, "prompt_cache_key").String()
+	if firstKey == "" {
+		t.Fatal("prompt_cache_key should not be empty")
 	}
-	if gotConversation := httpReq.Header.Get("Conversation_id"); gotConversation != expectedKey {
-		t.Fatalf("Conversation_id = %q, want %q", gotConversation, expectedKey)
+	if gotConversation := httpReq.Header.Get("Conversation_id"); gotConversation != "" {
+		t.Fatalf("Conversation_id = %q, want empty", gotConversation)
 	}
-	if gotSession := httpReq.Header.Get("Session_id"); gotSession != expectedKey {
-		t.Fatalf("Session_id = %q, want %q", gotSession, expectedKey)
+	if gotSession := httpReq.Header.Get("Session_id"); gotSession != firstKey {
+		t.Fatalf("Session_id = %q, want %q", gotSession, firstKey)
 	}
 
-	httpReq2, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON)
+	httpReq2, cacheKey2, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON)
 	if err != nil {
 		t.Fatalf("cacheHelper error (second call): %v", err)
+	}
+	if cacheKey2 != cacheKey {
+		t.Fatalf("cacheKey mismatch: %q != %q", cacheKey2, cacheKey)
 	}
 	body2, errRead2 := io.ReadAll(httpReq2.Body)
 	if errRead2 != nil {
 		t.Fatalf("read request body (second call): %v", errRead2)
 	}
 	gotKey2 := gjson.GetBytes(body2, "prompt_cache_key").String()
-	if gotKey2 != expectedKey {
-		t.Fatalf("prompt_cache_key (second call) = %q, want %q", gotKey2, expectedKey)
+	if gotKey2 != firstKey {
+		t.Fatalf("prompt_cache_key (second call) = %q, want %q", gotKey2, firstKey)
+	}
+
+	deleteCodexCache(cacheKey)
+	httpReq3, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON)
+	if err != nil {
+		t.Fatalf("cacheHelper error (third call): %v", err)
+	}
+	body3, errRead3 := io.ReadAll(httpReq3.Body)
+	if errRead3 != nil {
+		t.Fatalf("read request body (third call): %v", errRead3)
+	}
+	gotKey3 := gjson.GetBytes(body3, "prompt_cache_key").String()
+	if gotKey3 == firstKey {
+		t.Fatalf("prompt_cache_key should rotate after cache deletion, still %q", gotKey3)
 	}
 }

@@ -190,7 +190,13 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, err
 	}
 
-	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
+	body = normalizeCodexToolsList(body)
+	body, wsHeaders, cacheKey := applyCodexPromptCacheHeaders(ctx, req, body)
+	defer func() {
+		if err != nil {
+			deleteCodexCache(cacheKey)
+		}
+	}()
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 
 	var authID, authLabel, authType, authValue string
@@ -306,12 +312,14 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
 		if errRead != nil {
+			deleteCodexCache(cacheKey)
 			recordAPIResponseError(ctx, e.cfg, errRead)
 			return resp, errRead
 		}
 		if msgType != websocket.TextMessage {
 			if msgType == websocket.BinaryMessage {
 				err = fmt.Errorf("codex websockets executor: unexpected binary message")
+				deleteCodexCache(cacheKey)
 				if sess != nil {
 					e.invalidateUpstreamConn(sess, conn, "unexpected_binary", err)
 				}
@@ -328,6 +336,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		appendAPIResponseChunk(ctx, e.cfg, payload)
 
 		if wsErr, ok := parseCodexWebsocketError(payload); ok {
+			deleteCodexCache(cacheKey)
 			if sess != nil {
 				e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
 			}
@@ -378,6 +387,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, body, requestedModel)
+	body = normalizeCodexToolsList(body)
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
 	wsURL, err := buildCodexResponsesWebsocketURL(httpURL)
@@ -385,7 +395,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, err
 	}
 
-	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
+	body, wsHeaders, cacheKey := applyCodexPromptCacheHeaders(ctx, req, body)
+	defer func() {
+		if err != nil {
+			deleteCodexCache(cacheKey)
+		}
+	}()
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 
 	var authID, authLabel, authType, authValue string
@@ -452,6 +467,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
 		recordAPIResponseError(ctx, e.cfg, errSend)
+		deleteCodexCache(cacheKey)
 		if sess != nil {
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 
@@ -542,6 +558,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 				terminateReason = "read_error"
 				terminateErr = errRead
+				deleteCodexCache(cacheKey)
 				recordAPIResponseError(ctx, e.cfg, errRead)
 				reporter.publishFailure(ctx)
 				_ = send(cliproxyexecutor.StreamChunk{Err: errRead})
@@ -552,6 +569,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					err = fmt.Errorf("codex websockets executor: unexpected binary message")
 					terminateReason = "unexpected_binary"
 					terminateErr = err
+					deleteCodexCache(cacheKey)
 					recordAPIResponseError(ctx, e.cfg, err)
 					reporter.publishFailure(ctx)
 					if sess != nil {
@@ -572,6 +590,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if wsErr, ok := parseCodexWebsocketError(payload); ok {
 				terminateReason = "upstream_error"
 				terminateErr = wsErr
+				deleteCodexCache(cacheKey)
 				recordAPIResponseError(ctx, e.cfg, wsErr)
 				reporter.publishFailure(ctx)
 				if sess != nil {
@@ -761,40 +780,34 @@ func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {
 	return parsed.String(), nil
 }
 
-func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte) ([]byte, http.Header) {
+func applyCodexPromptCacheHeaders(ctx context.Context, req cliproxyexecutor.Request, rawJSON []byte) ([]byte, http.Header, string) {
 	headers := http.Header{}
 	if len(rawJSON) == 0 {
-		return rawJSON, headers
+		return rawJSON, headers, ""
 	}
 
-	var cache codexCache
-	if from == "claude" {
-		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
-		if userIDResult.Exists() {
-			key := fmt.Sprintf("%s-%s", req.Model, userIDResult.String())
-			if cached, ok := getCodexCache(key); ok {
-				cache = cached
-			} else {
-				cache = codexCache{
-					ID:     uuid.New().String(),
-					Expire: time.Now().Add(1 * time.Hour),
-				}
-				setCodexCache(key, cache)
-			}
-		}
-	} else if from == "openai-response" {
-		if promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key"); promptCacheKey.Exists() {
-			cache.ID = promptCacheKey.String()
-		}
+	var incomingHeaders http.Header
+	if ginCtx := ginContextFrom(ctx); ginCtx != nil && ginCtx.Request != nil {
+		incomingHeaders = ginCtx.Request.Header
 	}
 
-	if cache.ID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
-		headers.Set("Conversation_id", cache.ID)
-		headers.Set("Session_id", cache.ID)
+	cacheKey := buildCodexSessionCacheKey(req.Model, req.Payload, incomingHeaders, strings.TrimSpace(apiKeyFromContext(ctx)))
+	sessionID := resolveCodexSessionWithCache(
+		ctx,
+		strings.TrimSpace(incomingHeaders.Get("Session_id")),
+		firstNonEmptyCodexPromptCacheKey(req.Payload, rawJSON),
+		strings.TrimSpace(incomingHeaders.Get("Conversation_id")),
+		cacheKey,
+		"session_id and prompt_cache_key missing on websocket request",
+	)
+	if sessionID != "" {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", sessionID)
+		rawJSON = setPromptCacheKeyInContexts(rawJSON, sessionID)
+		headers.Set("Conversation_id", sessionID)
+		headers.Set("Session_id", sessionID)
 	}
 
-	return rawJSON, headers
+	return rawJSON, headers, cacheKey
 }
 
 func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config) http.Header {
