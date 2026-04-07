@@ -135,6 +135,21 @@ func TestAmpProviderModelRoutes(t *testing.T) {
 	}
 }
 
+func TestRootHeadRoute(t *testing.T) {
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodHead, "/", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d want %d", rr.Code, http.StatusOK)
+	}
+	if rr.Body.Len() != 0 {
+		t.Fatalf("HEAD / should not return a body, got %q", rr.Body.String())
+	}
+}
+
 func TestDefaultRequestLoggerFactory_UsesResolvedLogDirectory(t *testing.T) {
 	t.Setenv("WRITABLE_PATH", "")
 	t.Setenv("writable_path", "")

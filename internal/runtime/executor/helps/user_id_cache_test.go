@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -19,6 +20,9 @@ func TestCachedUserID_ReusesWithinTTL(t *testing.T) {
 
 	if first == "" {
 		t.Fatal("expected generated user_id to be non-empty")
+	}
+	if !IsValidUserID(first) || !IsValidUserID(second) {
+		t.Fatalf("expected cached user_ids to be valid, got %q and %q", first, second)
 	}
 	if first != second {
 		t.Fatalf("expected cached user_id to be reused, got %q and %q", first, second)
@@ -44,6 +48,9 @@ func TestCachedUserID_ExpiresAfterTTL(t *testing.T) {
 	if newID == "" {
 		t.Fatal("expected regenerated user_id to be non-empty")
 	}
+	if !IsValidUserID(newID) {
+		t.Fatalf("expected regenerated user_id to be valid, got %q", newID)
+	}
 }
 
 func TestCachedUserID_IsScopedByAPIKey(t *testing.T) {
@@ -52,6 +59,9 @@ func TestCachedUserID_IsScopedByAPIKey(t *testing.T) {
 	first := CachedUserID("api-key-1")
 	second := CachedUserID("api-key-2")
 
+	if !IsValidUserID(first) || !IsValidUserID(second) {
+		t.Fatalf("expected scoped user_ids to be valid, got %q and %q", first, second)
+	}
 	if first == second {
 		t.Fatalf("expected different API keys to have different user_ids, got %q", first)
 	}
@@ -75,6 +85,9 @@ func TestCachedUserID_RenewsTTLOnHit(t *testing.T) {
 	if refreshed := CachedUserID(key); refreshed != id {
 		t.Fatalf("expected cached user_id to be reused before expiry, got %q", refreshed)
 	}
+	if !IsValidUserID(id) {
+		t.Fatalf("expected cached user_id to be valid, got %q", id)
+	}
 
 	userIDCacheMu.RLock()
 	entry := userIDCache[cacheKey]
@@ -82,5 +95,16 @@ func TestCachedUserID_RenewsTTLOnHit(t *testing.T) {
 
 	if entry.expire.Sub(soon) < 30*time.Minute {
 		t.Fatalf("expected TTL to renew, got %v remaining", entry.expire.Sub(soon))
+	}
+}
+
+func TestGenerateFakeUserID_UsesEmptyAccountSegment(t *testing.T) {
+	userID := GenerateFakeUserID()
+
+	if !IsValidUserID(userID) {
+		t.Fatalf("expected generated user_id to be valid, got %q", userID)
+	}
+	if len(userID) == 0 || !strings.Contains(userID, "_account__session_") {
+		t.Fatalf("expected generated user_id to use empty account segment, got %q", userID)
 	}
 }

@@ -1,10 +1,37 @@
 package chat_completions
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/tidwall/gjson"
 )
+
+func resetClaudeChatCompletionsUserIDState() {
+	user = ""
+	account = ""
+	session = ""
+}
+
+func TestConvertOpenAIRequestToClaude_GeneratesEmptyAccountUserID(t *testing.T) {
+	resetClaudeChatCompletionsUserIDState()
+	t.Cleanup(resetClaudeChatCompletionsUserIDState)
+
+	result := ConvertOpenAIRequestToClaude(
+		"claude-sonnet-4-5",
+		[]byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hello"}]}`),
+		false,
+	)
+
+	userID := gjson.GetBytes(result, "metadata.user_id").String()
+	if !helps.IsValidUserID(userID) {
+		t.Fatalf("expected valid metadata.user_id, got %q", userID)
+	}
+	if !strings.Contains(userID, "_account__session_") {
+		t.Fatalf("expected metadata.user_id to use empty account segment, got %q", userID)
+	}
+}
 
 func TestConvertOpenAIRequestToClaude_ToolResultTextAndBase64Image(t *testing.T) {
 	inputJSON := `{

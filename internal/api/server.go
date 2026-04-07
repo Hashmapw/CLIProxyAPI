@@ -362,6 +362,9 @@ func (s *Server) setupRoutes() {
 			},
 		})
 	})
+	s.engine.HEAD("/", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
 	s.engine.POST("/v1internal:method", geminiCLIHandlers.CLIHandler)
 
 	// OAuth callback endpoints (reuse main server port)
