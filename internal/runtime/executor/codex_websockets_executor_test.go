@@ -52,8 +52,8 @@ func TestApplyCodexPromptCacheHeaders_PreservesPromptCacheRetention(t *testing.T
 	if got := headers.Get("session_id"); got != "cache-key-1" {
 		t.Fatalf("session_id = %q, want %q", got, "cache-key-1")
 	}
-	if got := headers.Get("Conversation_id"); got != "" {
-		t.Fatalf("Conversation_id = %q, want empty", got)
+	if got := headers.Get("Conversation_id"); got != "cache-key-1" {
+		t.Fatalf("Conversation_id = %q, want %q", got, "cache-key-1")
 	}
 }
 
@@ -74,6 +74,9 @@ func TestApplyCodexPromptCacheHeaders_ClaudePreservesContinuity(t *testing.T) {
 	}
 	if got := headers.Get("session_id"); got != continuity.Key {
 		t.Fatalf("session_id = %q, want %q", got, continuity.Key)
+	}
+	if got := headers.Get("Conversation_id"); got != continuity.Key {
+		t.Fatalf("Conversation_id = %q, want %q", got, continuity.Key)
 	}
 }
 

@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/google/uuid"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
@@ -15,8 +14,37 @@ import (
 )
 
 type codexContinuity struct {
-	Key    string
-	Source string
+	Key      string
+	Source   string
+	CacheKey string
+}
+
+func (c codexContinuity) shouldPersistManagedCache() bool {
+	return c.CacheKey != "" && (c.Source == "session_cache" || c.Source == "generated_uuid_v7")
+}
+
+func (c codexContinuity) allowsFixedSessionRetry() bool {
+	return c.shouldPersistManagedCache()
+}
+
+func clearCodexContinuityCache(continuity codexContinuity) {
+	if continuity.shouldPersistManagedCache() {
+		deleteCodexCache(continuity.CacheKey)
+	}
+}
+
+func shouldRetryCodexContinuity(ctx context.Context, attempt int, continuity codexContinuity, cause error) bool {
+	if attempt > 0 || !continuity.allowsFixedSessionRetry() {
+		return false
+	}
+	clearCodexContinuityCache(continuity)
+	logWithRequestID(ctx).Warnf(
+		"codex executor: clearing fixed session cache and retrying once (source=%s, cache_key=%s, err=%v)",
+		continuity.Source,
+		continuity.CacheKey,
+		cause,
+	)
+	return true
 }
 
 func metadataString(meta map[string]any, key string) string {
@@ -37,42 +65,43 @@ func metadataString(meta map[string]any, key string) string {
 	}
 }
 
-func principalString(raw any) string {
-	switch v := raw.(type) {
-	case string:
-		return strings.TrimSpace(v)
-	case fmt.Stringer:
-		return strings.TrimSpace(v.String())
-	default:
-		return strings.TrimSpace(fmt.Sprintf("%v", raw))
-	}
-}
-
 func resolveCodexContinuity(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) codexContinuity {
-	if promptCacheKey := strings.TrimSpace(gjson.GetBytes(req.Payload, "prompt_cache_key").String()); promptCacheKey != "" {
-		return codexContinuity{Key: promptCacheKey, Source: "prompt_cache_key"}
+	var incomingHeaders http.Header
+	if ginCtx := ginContextFrom(ctx); ginCtx != nil && ginCtx.Request != nil {
+		incomingHeaders = ginCtx.Request.Header
 	}
-	if executionSession := metadataString(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); executionSession != "" {
-		return codexContinuity{Key: executionSession, Source: "execution_session"}
+
+	continuity := codexContinuity{
+		CacheKey: buildCodexSessionCacheKey(auth, req.Payload, incomingHeaders, codexSessionFallbackAPIKey(ctx, auth)),
 	}
-	if ginCtx := ginContextFrom(ctx); ginCtx != nil {
-		if ginCtx.Request != nil {
-			if v := strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key")); v != "" {
-				return codexContinuity{Key: v, Source: "idempotency_key"}
-			}
-		}
-		if v, exists := ginCtx.Get("apiKey"); exists && v != nil {
-			if trimmed := principalString(v); trimmed != "" {
-				return codexContinuity{Key: uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+trimmed)).String(), Source: "client_principal"}
-			}
-		}
+	incomingSessionID := strings.TrimSpace(incomingHeaders.Get("Session_id"))
+	incomingConversationID := strings.TrimSpace(incomingHeaders.Get("Conversation_id"))
+	incomingPromptCacheKey := codexPromptCacheKey(req.Payload)
+
+	switch {
+	case incomingSessionID != "":
+		continuity.Key = incomingSessionID
+		continuity.Source = "session_id_header"
+	case incomingPromptCacheKey != "":
+		continuity.Key = incomingPromptCacheKey
+		continuity.Source = "prompt_cache_key"
+	case incomingConversationID != "":
+		continuity.Key = incomingConversationID
+		continuity.Source = "conversation_id"
+	case metadataString(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey) != "":
+		continuity.Key = metadataString(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey)
+		continuity.Source = "execution_session"
+	case strings.TrimSpace(incomingHeaders.Get("Idempotency-Key")) != "":
+		continuity.Key = strings.TrimSpace(incomingHeaders.Get("Idempotency-Key"))
+		continuity.Source = "idempotency_key"
+	default:
+		continuity = resolveManagedCodexContinuity(
+			ctx,
+			continuity.CacheKey,
+			fmt.Sprintf("resolve codex continuity miss (from=%s)", strings.TrimSpace(opts.SourceFormat.String())),
+		)
 	}
-	if auth != nil {
-		if authID := strings.TrimSpace(auth.ID); authID != "" {
-			return codexContinuity{Key: uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:auth:"+authID)).String(), Source: "auth_id"}
-		}
-	}
-	return codexContinuity{}
+	return continuity
 }
 
 func applyCodexContinuityBody(rawJSON []byte, continuity codexContinuity) []byte {
@@ -80,14 +109,14 @@ func applyCodexContinuityBody(rawJSON []byte, continuity codexContinuity) []byte
 		return rawJSON
 	}
 	rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", continuity.Key)
-	return rawJSON
+	return setPromptCacheKeyInContexts(rawJSON, continuity.Key)
 }
 
 func applyCodexContinuityHeaders(headers http.Header, continuity codexContinuity) {
 	if headers == nil || continuity.Key == "" {
 		return
 	}
-	headers.Set("session_id", continuity.Key)
+	headers.Set("Session_id", continuity.Key)
 }
 
 func logCodexRequestDiagnostics(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, headers http.Header, body []byte, continuity codexContinuity) {
@@ -104,13 +133,14 @@ func logCodexRequestDiagnostics(ctx context.Context, auth *cliproxyauth.Auth, re
 	selectedAuthID := metadataString(opts.Metadata, cliproxyexecutor.SelectedAuthMetadataKey)
 	executionSessionID := metadataString(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey)
 	entry.Debugf(
-		"codex request diagnostics auth_id=%s selected_auth_id=%s auth_file=%s exec_session=%s continuity_source=%s session_id=%s prompt_cache_key=%s prompt_cache_retention=%s store=%t has_instructions=%t reasoning_effort=%s reasoning_summary=%s chatgpt_account_id=%t originator=%s model=%s source_format=%s",
+		"codex request diagnostics auth_id=%s selected_auth_id=%s auth_file=%s exec_session=%s continuity_source=%s continuity_cache_key=%s session_id=%s prompt_cache_key=%s prompt_cache_retention=%s store=%t has_instructions=%t reasoning_effort=%s reasoning_summary=%s chatgpt_account_id=%t originator=%s model=%s source_format=%s",
 		authID,
 		selectedAuthID,
 		authFile,
 		executionSessionID,
 		continuity.Source,
-		strings.TrimSpace(headers.Get("session_id")),
+		continuity.CacheKey,
+		strings.TrimSpace(headers.Get("Session_id")),
 		gjson.GetBytes(body, "prompt_cache_key").String(),
 		gjson.GetBytes(body, "prompt_cache_retention").String(),
 		gjson.GetBytes(body, "store").Bool(),
