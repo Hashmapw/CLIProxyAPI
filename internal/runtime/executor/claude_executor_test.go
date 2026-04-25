@@ -893,7 +893,7 @@ func TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled(t *testing.T) {
 	t.Logf("✓ End-to-end test passed: Same user_id (%s) was used for both models", userIDs[0])
 }
 
-func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
+func TestClaudeExecutor_ReusesManagedUserIDByDefault(t *testing.T) {
 	var userIDs []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -928,8 +928,8 @@ func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
 	if userIDs[0] == "" || userIDs[1] == "" {
 		t.Fatal("expected user_id to be populated")
 	}
-	if userIDs[0] == userIDs[1] {
-		t.Fatalf("expected user_id to change when caching is not enabled, got identical values %q", userIDs[0])
+	if userIDs[0] != userIDs[1] {
+		t.Fatalf("expected managed user_id to be reused by default, got %q and %q", userIDs[0], userIDs[1])
 	}
 	if !helps.IsValidUserID(userIDs[0]) || !helps.IsValidUserID(userIDs[1]) {
 		t.Fatalf("user_ids should be valid, got %q and %q", userIDs[0], userIDs[1])
