@@ -347,7 +347,9 @@ func TestApplyCodexWebsocketHeadersPreservesExplicitAPIKeyUserAgent(t *testing.T
 func TestApplyCodexPromptCacheHeadersSetsLowercaseSessionAndLegacyConversation(t *testing.T) {
 	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"prompt_cache_key":"cache-1"}`)}
 
-	_, headers := applyCodexPromptCacheHeaders("openai-response", req, []byte(`{"model":"gpt-5-codex"}`))
+	_, headers, _ := applyCodexPromptCacheHeaders(context.Background(), nil, sdktranslator.FromString("openai-response"), req, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+	}, []byte(`{"model":"gpt-5-codex"}`))
 
 	if got := headerValueCaseInsensitive(headers, "session_id"); got != "cache-1" {
 		t.Fatalf("session_id = %s, want cache-1", got)

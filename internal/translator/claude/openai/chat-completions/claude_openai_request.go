@@ -58,7 +58,7 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		sum := sha256.Sum256([]byte(account + session))
 		user = hex.EncodeToString(sum[:])
 	}
-	userID := fmt.Sprintf("user_%s_account_%s_session_%s", user, account, session)
+	userID := fmt.Sprintf("user_%s_account__session_%s", user, session)
 
 	// Base Claude Code API template with default max_tokens value
 	out := []byte(fmt.Sprintf(`{"model":"","max_tokens":32000,"messages":[],"metadata":{"user_id":"%s"}}`, userID))
