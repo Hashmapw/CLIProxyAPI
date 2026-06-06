@@ -385,7 +385,10 @@ func TestApplyCodexWebsocketHeadersUsesCanonicalAccountHeader(t *testing.T) {
 func TestApplyCodexPromptCacheHeadersSetsSessionIDAndLegacyConversation(t *testing.T) {
 	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"prompt_cache_key":"cache-1"}`)}
 
-	_, headers := applyCodexPromptCacheHeaders("openai-response", req, []byte(`{"model":"gpt-5-codex"}`))
+	sourceFormat := sdktranslator.FromString("openai-response")
+	_, headers, _ := applyCodexPromptCacheHeaders(context.Background(), nil, sourceFormat, req, cliproxyexecutor.Options{
+		SourceFormat: sourceFormat,
+	}, []byte(`{"model":"gpt-5-codex"}`))
 
 	if got := headers["session_id"]; len(got) != 1 || got[0] != "cache-1" {
 		t.Fatalf("session_id = %#v, want [cache-1]", got)
@@ -398,7 +401,10 @@ func TestApplyCodexPromptCacheHeadersSetsSessionIDAndLegacyConversation(t *testi
 	}
 }
 
-func TestApplyCodexPromptCacheHeadersClaudeUsesClaudeCodeSessionID(t *testing.T) {
+func TestApplyCodexPromptCacheHeadersUsesManagedAuthSession(t *testing.T) {
+	auth := &cliproxyauth.Auth{ID: "ws-managed-auth", Provider: "codex"}
+	sourceFormat := sdktranslator.FromString("claude")
+	opts := cliproxyexecutor.Options{SourceFormat: sourceFormat}
 	firstReq := cliproxyexecutor.Request{
 		Model: "gpt-5-codex-claude-ws-cache-session",
 		Payload: []byte(`{
@@ -414,8 +420,8 @@ func TestApplyCodexPromptCacheHeadersClaudeUsesClaudeCodeSessionID(t *testing.T)
 		}`),
 	}
 
-	firstBody, firstHeaders := applyCodexPromptCacheHeaders("claude", firstReq, []byte(`{"model":"gpt-5-codex"}`))
-	secondBody, secondHeaders := applyCodexPromptCacheHeaders("claude", secondReq, []byte(`{"model":"gpt-5-codex"}`))
+	firstBody, firstHeaders, firstContinuity := applyCodexPromptCacheHeaders(context.Background(), auth, sourceFormat, firstReq, opts, []byte(`{"model":"gpt-5-codex"}`))
+	secondBody, secondHeaders, secondContinuity := applyCodexPromptCacheHeaders(context.Background(), auth, sourceFormat, secondReq, opts, []byte(`{"model":"gpt-5-codex"}`))
 
 	firstKey := gjson.GetBytes(firstBody, "prompt_cache_key").String()
 	secondKey := gjson.GetBytes(secondBody, "prompt_cache_key").String()
@@ -423,7 +429,10 @@ func TestApplyCodexPromptCacheHeadersClaudeUsesClaudeCodeSessionID(t *testing.T)
 		t.Fatalf("first prompt_cache_key is empty; body=%s", string(firstBody))
 	}
 	if secondKey != firstKey {
-		t.Fatalf("same Claude Code session_id produced different websocket prompt_cache_key: first=%q second=%q", firstKey, secondKey)
+		t.Fatalf("same auth managed websocket prompt_cache_key changed: first=%q second=%q", firstKey, secondKey)
+	}
+	if firstContinuity.CacheKey != "auth:ws-managed-auth" || secondContinuity.CacheKey != firstContinuity.CacheKey {
+		t.Fatalf("managed cache keys = %q/%q, want auth:ws-managed-auth", firstContinuity.CacheKey, secondContinuity.CacheKey)
 	}
 	if got := firstHeaders["session_id"]; len(got) != 1 || got[0] != firstKey {
 		t.Fatalf("first session_id = %#v, want [%q]", got, firstKey)
@@ -433,25 +442,29 @@ func TestApplyCodexPromptCacheHeadersClaudeUsesClaudeCodeSessionID(t *testing.T)
 	}
 }
 
-func TestApplyCodexPromptCacheHeadersClaudeRejectsBareUserID(t *testing.T) {
+func TestApplyCodexPromptCacheHeadersExplicitSessionHeaderWins(t *testing.T) {
+	sourceFormat := sdktranslator.FromString("claude")
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5-codex-claude-ws-cache-bare-user",
 		Payload: []byte(`{"metadata":{"user_id":"same-user-across-chats"},"messages":[{"role":"user","content":[{"type":"text","text":"first"}]}]}`),
 	}
 
-	body, headers := applyCodexPromptCacheHeaders("claude", req, []byte(`{"model":"gpt-5-codex"}`))
+	body, headers, continuity := applyCodexPromptCacheHeaders(context.Background(), nil, sourceFormat, req, cliproxyexecutor.Options{
+		SourceFormat: sourceFormat,
+		Headers:      http.Header{"Session_id": []string{"explicit-ws-session"}},
+	}, []byte(`{"model":"gpt-5-codex"}`))
 
-	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != "" {
-		t.Fatalf("bare metadata.user_id must not create websocket prompt_cache_key, got %q; body=%s", got, string(body))
+	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != "explicit-ws-session" {
+		t.Fatalf("prompt_cache_key = %q, want explicit-ws-session; body=%s", got, string(body))
 	}
-	if got := headers["session_id"]; len(got) != 0 {
-		t.Fatalf("bare metadata.user_id must not create websocket session_id, got %#v", got)
+	if got := headers["session_id"]; len(got) != 1 || got[0] != "explicit-ws-session" {
+		t.Fatalf("session_id = %#v, want [explicit-ws-session]", got)
 	}
-	if got := headers.Get("Session-Id"); got != "" {
-		t.Fatalf("bare metadata.user_id must not create websocket Session-Id, got %q", got)
+	if got := headers.Get("Conversation_id"); got != "explicit-ws-session" {
+		t.Fatalf("Conversation_id = %q, want explicit-ws-session", got)
 	}
-	if got := headers.Get("Conversation_id"); got != "" {
-		t.Fatalf("bare metadata.user_id must not create websocket Conversation_id, got %q", got)
+	if continuity.Source != "session_id_header" {
+		t.Fatalf("continuity source = %q, want session_id_header", continuity.Source)
 	}
 }
 
@@ -466,7 +479,10 @@ func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testin
 		Payload: []byte(`{"prompt_cache_key":"cache-ws-1","client_metadata":{"x-codex-installation-id":"install-ws-1"}}`),
 	}
 
-	body, headers := applyCodexPromptCacheHeaders("openai-response", req, []byte(`{"model":"gpt-5-codex"}`))
+	sourceFormat := sdktranslator.FromString("openai-response")
+	body, headers, _ := applyCodexPromptCacheHeaders(context.Background(), auth, sourceFormat, req, cliproxyexecutor.Options{
+		SourceFormat: sourceFormat,
+	}, []byte(`{"model":"gpt-5-codex"}`))
 	body, identityState := applyCodexIdentityConfuseBody(cfg, auth, req.Payload, body)
 	ctx := contextWithGinHeaders(map[string]string{
 		"X-Codex-Turn-Metadata": `{"prompt_cache_key":"cache-ws-1","turn_id":"turn-ws-1","window_id":"cache-ws-1:0"}`,
